@@ -1,0 +1,169 @@
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import cartopy.crs as ccrs
+import geopandas as gpd
+import rioxarray
+import pandas as pd
+import seaborn as sns
+from shapely.geometry import Point
+from matplotlib.lines import Line2D
+from matplotlib.patches import ConnectionPatch
+
+# === Load GRIDMET Data ===
+base_url = "http://thredds.northwestknowledge.net:8080/thredds/dodsC/"
+tmax_url = base_url + "agg_met_tmmx_1979_CurrentYear_CONUS.nc"
+pr_url = base_url + "agg_met_pr_1979_CurrentYear_CONUS.nc"
+
+target_days = slice("2025-03-25", "2025-03-26")
+clim_years = range(1991, 2021)
+lat_bounds = slice(50, 41)
+lon_bounds = slice(-125, -115)
+
+# Load datasets
+ds_tmax = xr.open_dataset(tmax_url)
+ds_pr = xr.open_dataset(pr_url)
+
+tmax = ds_tmax['daily_maximum_temperature'].sel(lat=lat_bounds, lon=lon_bounds) - 273.15
+pr = ds_pr['precipitation_amount'].sel(lat=lat_bounds, lon=lon_bounds)
+
+tmax_2025 = tmax.sel(day=target_days).mean('day')
+pr_2025 = pr.sel(day=target_days).mean('day')
+
+tmax_clim = xr.concat([
+    tmax.sel(day=slice(f"{y}-03-25", f"{y}-03-26")).mean('day') for y in clim_years
+], dim='year').mean('year')
+
+pr_clim = xr.concat([
+    pr.sel(day=slice(f"{y}-03-25", f"{y}-03-26")).mean('day') for y in clim_years
+], dim='year').mean('year')
+
+tmax_anom = tmax_2025 - tmax_clim
+pr_anom = pr_2025 - pr_clim
+ratio_anom = pr_anom / tmax_anom.where(tmax_anom != 0)
+
+# === Load & Mask Counties ===
+counties = gpd.read_file("https://www2.census.gov/geo/tiger/TIGER2022/COUNTY/tl_2022_us_county.zip")
+pnw_counties = counties[counties["STATEFP"].isin(["41", "53", "16"])]
+target_counties = pnw_counties[pnw_counties["NAME"].isin(["Clark", "Multnomah"])]
+
+def mask_to_counties(data):
+    data = data.rio.write_crs("EPSG:4326", inplace=True)
+    return data.rio.clip(pnw_counties.geometry.values, pnw_counties.crs, drop=True)
+
+tmax_2025_masked = mask_to_counties(tmax_2025)
+tmax_anom_masked = mask_to_counties(tmax_anom)
+pr_anom_masked = mask_to_counties(pr_anom)
+ratio_anom_masked = mask_to_counties(ratio_anom)
+
+# === County-Level Time Series ===
+years = list(range(1991, 2026))
+target_counties = target_counties.to_crs("EPSG:4326")
+lat_bounds = slice(50, 45)
+lon_bounds = slice(-123.5, -122.0)
+
+tmax = ds_tmax['daily_maximum_temperature'].sel(lat=lat_bounds, lon=lon_bounds) - 273.15
+pr = ds_pr['precipitation_amount'].sel(lat=lat_bounds, lon=lon_bounds)
+
+records = []
+for y in years:
+    d_slice = slice(f"{y}-03-25", f"{y}-03-26")
+    tmax_mean = tmax.sel(day=d_slice).mean("day")
+    pr_mean = pr.sel(day=d_slice).mean("day")
+
+    lon, lat = np.meshgrid(tmax_mean['lon'], tmax_mean['lat'])
+    df = pd.DataFrame({
+        'lon': lon.ravel(),
+        'lat': lat.ravel(),
+        'Tmax': tmax_mean.values.ravel(),
+        'Precip': pr_mean.values.ravel(),
+        'Year': y
+    })
+    geometry = [Point(xy) for xy in zip(df.lon, df.lat)]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+
+    joined = gpd.sjoin(gdf, target_counties, how='inner', predicate='intersects')
+    joined = joined.rename(columns={"NAME": "County"})
+
+    yearly = joined.groupby("County")[["Tmax", "Precip"]].mean().reset_index()
+    yearly["Year"] = y
+    records.append(yearly)
+
+df_all = pd.concat(records)
+clim = df_all[df_all["Year"] < 2021].groupby("County")[["Tmax", "Precip"]].mean().reset_index()
+df_merged = df_all.merge(clim, on="County", suffixes=("", "_clim"))
+df_merged["Tmax Anomaly"] = df_merged["Tmax"] - df_merged["Tmax_clim"]
+df_merged["Precip Anomaly"] = df_merged["Precip"] - df_merged["Precip_clim"]
+df_merged["Precip/Tmax Anomaly"] = df_merged["Precip Anomaly"] / df_merged["Tmax Anomaly"].where(df_merged["Tmax Anomaly"] != 0)
+
+# === Plot Combined Infographic ===
+fig = plt.figure(figsize=(16, 12))
+map_positions = [
+    [0.05, 0.55, 0.4, 0.4],
+    [0.55, 0.55, 0.4, 0.4],
+    [0.05, 0.05, 0.4, 0.4],
+    [0.55, 0.05, 0.4, 0.4]
+]
+chart_positions = [
+    [0.43, 0.8, 0.15, 0.13],
+    [0.43, 0.6, 0.15, 0.13],
+    [0.43, 0.32, 0.15, 0.13],
+    [0.43, 0.13, 0.15, 0.13]
+]
+maps = [
+    (tmax_2025_masked, "Tmax (\u00b0C) — March 25–26, 2025", "Reds", np.arange(5, 30, 2), "\u00b0C"),
+    (tmax_anom_masked, "Tmax Anomaly vs 1991–2020", "bwr", np.linspace(-2, 12, 11), "\u00b0C"),
+    (pr_anom_masked, "Precip Anomaly vs 1991–2020", "BrBG", np.arange(-10, 11, 2), "mm"),
+    (ratio_anom_masked, "Precip per \u00b0C Anomaly", "cividis", np.linspace(-5, 5, 11), "mm/\u00b0C")
+]
+metrics = ["Tmax", "Tmax Anomaly", "Precip Anomaly", "Precip/Tmax Anomaly"]
+
+for i, (bbox, (data, title, cmap, bins, unit), chart_box, metric) in enumerate(zip(map_positions, maps, chart_positions, metrics)):
+    ax = fig.add_axes(bbox, projection=ccrs.PlateCarree())
+    norm = mcolors.BoundaryNorm(bins, ncolors=plt.get_cmap(cmap).N)
+    img = data.plot(ax=ax, cmap=cmap, norm=norm, add_colorbar=False, transform=ccrs.PlateCarree())
+    ax.set_extent([-125, -115, 41, 50])
+
+    for geom in pnw_counties.geometry:
+        ax.add_geometries([geom], ccrs.PlateCarree(), facecolor='none', edgecolor='black', linewidth=0.5)
+    for geom in target_counties.geometry:
+        ax.add_geometries([geom], ccrs.PlateCarree(), facecolor='none', edgecolor='yellow', linewidth=1.5)
+
+    ax.coastlines()
+    ax.set_title(title, fontsize=11)
+    cbar = fig.colorbar(img, ax=ax, orientation='horizontal', location='bottom', shrink=0.7, pad=0.01)
+    cbar.set_label(unit)
+
+    # Chart
+    inset_ax = fig.add_axes(chart_box)
+    sns.lineplot(data=df_merged, x="Year", y=metric, hue="County", marker="o", ax=inset_ax, legend=False)
+    sns.scatterplot(data=df_merged[df_merged["Year"] == 2025], x="Year", y=metric,
+                    hue="County", palette="dark", s=60, legend=False, ax=inset_ax, marker="X")
+    inset_ax.axhline(0, linestyle="--", color="gray", linewidth=1)
+    inset_ax.set_title(metric, fontsize=9)
+    inset_ax.tick_params(labelsize=7)
+    inset_ax.grid(True, alpha=0.4)
+    from matplotlib.lines import Line2D
+
+    legend_elements = [
+        Line2D([0], [0], color=sns.color_palette()[0], lw=1.5, label='Clark'),
+        Line2D([0], [0], color=sns.color_palette()[1], lw=1.5, label='Multnomah')
+    ]
+    inset_ax.legend(handles=legend_elements, fontsize=6, loc='upper left', frameon=False)
+
+
+    # === Connection Line ===
+   # county_centroid = target_counties.geometry.centroid.unary_union.centroid
+    #line = ConnectionPatch(
+        #xyA=(0.5, 0.5), coordsA=inset_ax.transAxes,
+        #xyB=ax.projection.transform_point(county_centroid.x, county_centroid.y, ccrs.PlateCarree()),
+        #coordsB=ax.transData, color='black', linewidth=0.7
+    #)
+   # fig.add_artist(line)
+
+plt.suptitle("Pacific Northwest Weather Anomalies\nMarch 25–26, 2025 vs. 1991–2020 Climatology", fontsize=16, y = 1.05)
+plt.savefig("pnw_anomaly_infographic_final.png", dpi=300)
+fig.text(0.5, 0.01, "Data Source: GRIDMET | Visualization by S.Preston", 
+         ha='center', va='bottom', fontsize=9, color='gray', alpha=0.8)
+plt.show()
